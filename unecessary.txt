@@ -1,0 +1,324 @@
+import pandas as pd
+from sklearn.preprocessing import KBinsDiscretizer
+from pgmpy.models import BayesianNetwork
+from pgmpy.estimators import HillClimbSearch, BicScore
+from pgmpy.estimators import MaximumLikelihoodEstimator
+from pgmpy.inference import VariableElimination
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, confusion_matrix, f1_score
+from imblearn.over_sampling import SMOTE
+import joblib
+
+# Import necessary libraries for Bayesian inference
+from scipy.stats import norm
+import numpy as np
+from scipy.integrate import quad
+
+# Define the prior distribution
+
+def prior(fertilizer_amount):
+    result = norm.pdf(fertilizer_amount, loc=100, scale=20)
+    print(f"Prior for {fertilizer_amount}: {result}")
+    return result
+
+# Define the likelihood function
+
+def likelihood(data, fertilizer_amount):
+    soil_quality = data['soil_quality']
+    moisture = data['moisture']
+    temperature = data['temperature']
+    predicted_yield = fertilizer_amount * soil_quality * moisture * temperature
+    result = norm.pdf(data['actual_yield'], loc=predicted_yield, scale=10)
+    print(f"Likelihood for {fertilizer_amount}: {result}")
+    return result
+
+# Compute the posterior distribution
+
+def bayesian_update(prior, likelihood, data, fertilizer_range):
+    posterior = lambda fertilizer_amount: likelihood(data, fertilizer_amount) * prior(fertilizer_amount)
+    normalizer, _ = quad(posterior, fertilizer_range[0], fertilizer_range[1])
+    print(f"Normalizer: {normalizer}")
+    return lambda fertilizer_amount: posterior(fertilizer_amount) / normalizer
+
+# Sampling from the posterior distribution
+
+def mcmc_sampling(posterior, num_samples, initial_guess, propose_new_fertilizer):
+    samples = []
+    current_fertilizer = initial_guess
+    for _ in range(num_samples):
+        proposed_fertilizer = propose_new_fertilizer(current_fertilizer)
+        acceptance_probability = min(1, posterior(proposed_fertilizer) / posterior(current_fertilizer))
+        if np.random.rand() < acceptance_probability:
+            current_fertilizer = proposed_fertilizer
+        samples.append(current_fertilizer)
+    print(f"Samples: {samples[:10]}...")  # Print first 10 samples for brevity
+    return samples
+
+# Infer the optimal fertilizer amount
+
+def infer_optimal_fertilizer(samples):
+    optimal_fertilizer = np.mean(samples)
+    uncertainty = np.std(samples)
+    print(f"Optimal Fertilizer: {optimal_fertilizer}, Uncertainty: {uncertainty}")
+    return optimal_fertilizer, uncertainty
+
+# Predict optimal yield
+
+def predict_optimal_yield(optimal_fertilizer, data):
+    soil_quality = data['soil_quality']
+    moisture = data['moisture']
+    temperature = data['temperature']
+    predicted_yield = optimal_fertilizer * soil_quality * moisture * temperature
+    return predicted_yield
+
+
+# Load the dataset
+file_path = r'c:\Users\user\Documents\Final year\dataset1.csv'
+data = pd.read_csv(file_path)
+
+# Display the first few rows of the dataset
+print("Data Preview:")
+print(data.head())
+
+# Check for missing values
+print("\nMissing Values:")
+print(data.isnull().sum())
+
+# Discretize the features
+discretizer = KBinsDiscretizer(n_bins=5, encode='ordinal', strategy='uniform', subsample=None)
+disc_data = discretizer.fit_transform(data.drop('Output', axis=1))
+
+# Convert discretized data back to DataFrame
+disc_df = pd.DataFrame(disc_data, columns=data.columns[:-1])
+disc_df['Output'] = data['Output']
+
+# Save the discretizer for later use
+joblib.dump(discretizer, 'discretizer.pkl')
+
+# Learn structure from data
+hc = HillClimbSearch(disc_df)
+best_model = hc.estimate(scoring_method=BicScore(disc_df))
+
+# Define the Bayesian Network with the learned structure
+model = BayesianNetwork(best_model.edges())
+
+# Manually add all features as nodes to ensure they are included
+all_features = ['N', 'P', 'K', 'pH', 'EC', 'OC', 'S', 'Zn', 'Fe', 'Cu', 'Mn', 'B', 'Output']
+for feature in all_features:
+    if feature not in model.nodes():
+        model.add_node(feature)
+
+# Apply SMOTE to balance the class distribution
+smote = SMOTE(random_state=42)
+X, y = disc_df.drop(columns='Output'), disc_df['Output']
+X_resampled, y_resampled = smote.fit_resample(X, y)
+
+# Combine resampled features and target into a new DataFrame
+resampled_df = pd.DataFrame(X_resampled, columns=X.columns)
+resampled_df['Output'] = y_resampled
+
+# Split the resampled data into training and testing sets
+train_df, test_df = train_test_split(resampled_df, test_size=0.2, random_state=42)
+
+# Fit the model using the training set
+model.fit(train_df, estimator=MaximumLikelihoodEstimator)
+# Ensure train_df is correctly structured with all necessary columns
+
+# Print model nodes to verify inclusion
+print("Model Nodes:", model.nodes())
+
+# Debugging: Print columns of the discretized DataFrame to ensure all features are included
+print("Columns in discretized DataFrame:", disc_df.columns.tolist())
+
+import joblib
+
+# Save the model to the current folder
+model_filename = 'bayesian_network_model.pkl'
+joblib.dump(model, model_filename)
+
+
+# Perform inference
+inference = VariableElimination(model)
+
+# Perform predictions on a subset of the test set for debugging
+test_evidence = test_df.drop(columns='Output')
+test_truth = test_df['Output']
+predictions = []
+
+# Perform predictions on the entire test set
+for _, row in test_evidence.iterrows():
+    evidence = {col: int(row[col]) for col in test_evidence.columns if col in model.nodes()}
+    # Validate that evidence matches the model nodes
+    print("Evidence:", evidence)  # Debugging: Print evidence
+    # Debugging: Print test evidence columns
+    print("Test Evidence Columns:", test_evidence.columns.tolist())
+    prediction = inference.map_query(variables=['Output'], evidence=evidence)
+    predictions.append(prediction['Output'])
+
+# Evaluate the model
+accuracy = accuracy_score(test_truth, predictions)
+precision = precision_score(test_truth, predictions, average='weighted', zero_division=1)
+# Handle cases where test set might not contain all classes
+recall = recall_score(test_truth, predictions, average='weighted')
+conf_matrix = confusion_matrix(test_truth, predictions)
+
+print(f"Accuracy: {accuracy}")
+print(f"Precision: {precision}")
+print(f"Recall: {recall}")
+print(f"Confusion Matrix:\n{conf_matrix}")
+
+# Check class distribution
+print("Class Distribution:")
+print(disc_df['Output'].value_counts())
+
+# Indicate the file has been saved
+print(f"The file '{model_filename}' has been saved.")
+
+# Sample input data for Bayesian update
+sample_data = {
+    'soil_quality': 0.8,
+    'moisture': 0.7,
+    'temperature': 0.9,
+    'actual_yield': 140  # Actual yield or expected yield
+}
+
+# Perform Bayesian update for fertilizer recommendation
+fertilizer_range = (50, 150)
+posterior = bayesian_update(prior, likelihood, sample_data, fertilizer_range)
+
+# Proposal function for MCMC
+propose_new_fertilizer = lambda x: np.random.normal(x, 2)
+
+# Generate samples and infer optimal fertilizer
+samples = mcmc_sampling(posterior, num_samples=1000, initial_guess=100, propose_new_fertilizer=propose_new_fertilizer)
+optimal_fert, uncertainty = infer_optimal_fertilizer(samples)
+predicted_yield = predict_optimal_yield(optimal_fert, sample_data)
+
+# Output the recommendations
+print(f"Recommended Fertilizer Amount: {optimal_fert:.2f} kg ± {uncertainty:.2f}")
+print(f"Predicted Yield: {predicted_yield:.2f} tons/ha")
+
+# Implement class weights in a RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier
+
+# Define class weights
+distribution = disc_df['Output'].value_counts(normalize=True)
+class_weights = {0: 1/distribution[0], 1: 1/distribution[1], 2: 1/distribution[2]}
+
+# Initialize and train the RandomForestClassifier with class weights
+rf_model = RandomForestClassifier(class_weight=class_weights, random_state=42)
+rf_model.fit(X_resampled, y_resampled)
+
+# Save the RandomForest model
+rf_model_filename = 'random_forest_model.pkl'
+joblib.dump(rf_model, rf_model_filename)
+
+# Use the RandomForest model for predictions
+rf_predictions = rf_model.predict(test_evidence)
+
+# Evaluate the RandomForest model
+rf_accuracy = accuracy_score(test_truth, rf_predictions)
+rf_precision = precision_score(test_truth, rf_predictions, average='weighted', zero_division=1)
+rf_recall = recall_score(test_truth, rf_predictions, average='weighted')
+rf_conf_matrix = confusion_matrix(test_truth, rf_predictions)
+
+print(f"RandomForest Accuracy: {rf_accuracy}")
+print(f"RandomForest Precision: {rf_precision}")
+print(f"RandomForest Recall: {rf_recall}")
+print(f"RandomForest Confusion Matrix:\n{rf_conf_matrix}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Load the dataset
+# file_path = r'c:\Users\user\Documents\Final year\dataset1.csv'
+# data = pd.read_csv(file_path)
+
+
+# class_labels = data['Output'].unique()
+# print("Class Labels:", class_labels)
+
+# Display the first few rows of the dataset
+# print("Data Preview:")
+# print(data.head())
+
+# Check for missing values
+# print("\nMissing Values:")
+# print(data.isnull().sum())
+
+# Discretize the features
+# discretizer = KBinsDiscretizer(n_bins=5, encode='ordinal', strategy='uniform', subsample=None)
+# disc_data = discretizer.fit_transform(data.drop('Output', axis=1))
+
+# Convert discretized data back to DataFrame
+# disc_df = pd.DataFrame(disc_data, columns=data.columns[:-1])
+# disc_df['Output'] = data['Output']
+
+# Learn structure from data
+# hc = HillClimbSearch(disc_df)
+# best_model = hc.estimate(scoring_method=BicScore(disc_df))
+
+# Define the Bayesian Network with the learned structure
+# model = BayesianNetwork(best_model.edges())
+
+# Apply SMOTE to balance the class distribution
+# smote = SMOTE(random_state=42)
+# X, y = disc_df.drop(columns='Output'), disc_df['Output']
+# X_resampled, y_resampled = smote.fit_resample(X, y)
+
+# Combine resampled features and target into a new DataFrame
+# resampled_df = pd.DataFrame(X_resampled, columns=X.columns)
+# resampled_df['Output'] = y_resampled
+
+# Split the resampled data into training and testing sets
+# train_df, test_df = train_test_split(resampled_df, test_size=0.2, random_state=42)
